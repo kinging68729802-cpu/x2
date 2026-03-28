@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jp
 from flax import struct
 
-from . import x2_constants as constants
+import x2_constant as constants
 
 
 @struct.dataclass

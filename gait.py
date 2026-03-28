@@ -6,7 +6,7 @@ x2_ultra 双足机器人步态生成器
 from typing import Dict, Tuple
 import jax.numpy as jp
 
-from . import x2_constants as constants
+import x2_constant as constants
 
 
 class GaitGenerator:

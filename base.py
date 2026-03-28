@@ -3,93 +3,66 @@ base_functional.py
 函数式 X2 Ultra 环境，兼容 JAX JIT/VMAP
 """
 
-import dataclasses
-from typing import Any, Dict, Tuple, Callable
+from typing import Any, Dict, Tuple
+from functools import partial
 import numpy as np
 import mujoco
 from mujoco import mjx
 import jax
 import jax.numpy as jp
 from flax import struct
-from functools import partial
+# 修复导入
+try:
+    from mujoco.mjx._src import math as mjx_math
+except ImportError:
+    # 备用方案
+    mjx_math = mjx._src.math
 import x2_constant as constants
-
-
 @struct.dataclass
-class X2UltraEnvState:
-    """纯函数式环境状态（可被 JAX 处理）"""
-    # 核心物理状态
+class X2UltraState:
+    """环境状态 - 与 __init__.py 导入名匹配"""
     physics_data: Any  # mjx.Data
-    
-    # 时间信息
-    time: jp.ndarray  # 标量数组，便于 JIT
+    time: jp.ndarray
     steps: jp.ndarray
-    
-    # 命令
-    command: jp.ndarray  # [4]
-    
-    # 历史
+    command: jp.ndarray      # [4]
     last_action: jp.ndarray  # [action_dim]
-    
-    # 随机数状态
-    rng: jp.ndarray
-
-
-@struct.dataclass
-class X2UltraConfig:
-    """环境配置（静态）"""
-    model_path: str = "x2_ultra.xml"
-    control_frequency: float = 50.0
-    simulation_frequency: float = 1000.0
-    
-    @property
-    def control_substeps(self) -> int:
-        return int(self.simulation_frequency / self.control_frequency)
-
-
-class X2UltraFunctionalEnv:
+class X2UltraBaseEnv:
     """
-    函数式环境：不保存状态，所有方法为纯函数
-    通过 jax.jit 编译 step/reset
+    与 __init__.py 导入名匹配的类
+    完全函数式设计，支持 JIT/VMAP
     """
     
     def __init__(self, config: Dict = None):
-        self.config = X2UltraConfig(**(config or {}))
+        self.config = config or {}
         self.const = constants.X2UltraConstants()
         
-        # 加载模型（只读，可被 JIT 捕获）
-        self._model = self._load_model()
+        # 加载模型
+        xml_path = self.config.get('model_path', 'x2_ultra.xml')
+        self._model = mujoco.MjModel.from_xml_path(xml_path)
         self._model_jx = mjx.put_model(self._model)
         
-        # 预计算维度
-        self.obs_dim = self._compute_obs_dim()
-        self.action_dim = self._model.nu
+        # 维度
+        self.action_dim = self._model.nu  # 29个执行器
+        self.observation_dim = self._compute_obs_dim()
         
-        print(f"[X2Ultra] 初始化完成: obs_dim={self.obs_dim}, action_dim={self.action_dim}")
-    
-    def _load_model(self) -> mujoco.MjModel:
-        xml_path = self.config.model_path
-        try:
-            model = mujoco.MjModel.from_xml_path(xml_path)
-            print(f"[X2Ultra] 加载模型: {xml_path}")
-            return model
-        except Exception as e:
-            raise RuntimeError(f"无法加载模型 {xml_path}: {e}")
+        print(f"[X2Ultra] obs_dim={self.observation_dim}, action_dim={self.action_dim}")
+        
+        # 预编译 JIT 函数（关键优化）
+        self._reset_jit = jax.jit(self._reset_impl, static_argnums=(0,))
+        self._step_jit = jax.jit(self._step_impl, static_argnums=(0,))
     
     def _compute_obs_dim(self) -> int:
         """计算观测维度"""
         cfg = self.const.OBSERVATION_CONFIG
+        n_joints = self.action_dim  # 使用执行器数作为关节数
+        
         dim = 0
-        
-        # 关节位置 (nq - 7 自由关节)
         if cfg["include_joint_pos"]:
-            dim += self._model.nq - 7
-        
-        # 关节速度 (nv - 6 自由关节)
+            dim += n_joints  # 实际控制关节位置
         if cfg["include_joint_vel"]:
-            dim += self._model.nv - 6
+            dim += n_joints
         
-        # IMU 数据
+        # IMU
         if cfg["include_body_lin_vel"]:
             dim += 3
         if cfg["include_body_ang_vel"]:
@@ -99,257 +72,254 @@ class X2UltraFunctionalEnv:
         if cfg["include_gravity_vector"]:
             dim += 3
         
-        # 命令和相位
+        # 命令和动作
         if cfg["include_command"]:
             dim += 4
         if cfg["include_phase"]:
             dim += 1
         if cfg["include_last_action"]:
-            dim += self._model.nu  # 动作维度
+            dim += self.action_dim
         
         return dim
     
-    # =========================================================================
-    # 纯函数：可被 jax.jit
-    # =========================================================================
+    # ========================================================================
+    # 公开 API（非 JIT，用于 Python 调用）
+    # ========================================================================
     
-    @partial(jax.jit, static_argnums=(0,))
-    def reset(self, rng: jp.ndarray) -> Tuple[X2UltraEnvState, jp.ndarray]:
-        """纯函数式重置"""
-        # 创建初始物理状态
+    def reset(self, rng: jp.ndarray) -> Tuple[X2UltraState, jp.ndarray]:
+        return self._reset_jit(rng)
+    
+    def step(self, state: X2UltraState, action: jp.ndarray, rng: jp.ndarray):
+        return self._step_jit(state, action, rng)
+    
+    # ========================================================================
+    # JIT 实现（内部使用）
+    # ========================================================================
+    
+    def _reset_impl(self, rng: jp.ndarray):
+        """JIT实现"""
         data = mjx.make_data(self._model_jx)
         
-        # 设置初始位置
-        qpos = data.qpos.at[2].set(0.68)  # 站立高度
+        # 设置初始高度
+        qpos = data.qpos.at[2].set(0.68)
         
-        # 设置默认关节角度
-        default_pos = self.const.DEFAULT_JOINT_POSITIONS
-        for i, pos in enumerate(default_pos):
-            if 7 + i < self._model.nq:
-                qpos = qpos.at[7 + i].set(pos)
+        # [关键修复] 扩展默认位置到29个关节
+        default_12 = self.const.DEFAULT_JOINT_POSITIONS  # 12个值
+        # 扩展到29个：腿部12个 + 其他置0
+        full_default = jp.zeros(self.action_dim)
+        full_default = full_default.at[:12].set(default_12)
+        # 设置腰部和头部为合理值
+        if self.action_dim > 12:
+            full_default = full_default.at[12:15].set(jp.array([0.0, 0.0, 0.0]))  # 腰部
+        if self.action_dim > 15:
+            full_default = full_default.at[15:17].set(jp.array([0.0, 0.0]))  # 头部
+        # 手臂自然下垂
+        if self.action_dim > 17:
+            full_default = full_default.at[17:29].set(jp.zeros(12))
         
+        # 设置关节位置
+        qpos = qpos.at[7:7+self.action_dim].set(full_default)
         data = data.replace(qpos=qpos)
         
-        # 生成随机命令
+        # 随机命令
         rng, cmd_rng = jax.random.split(rng)
-        command = self._sample_command(cmd_rng)
+        cmd = self._sample_command(cmd_rng)
         
-        # 创建状态
-        state = X2UltraEnvState(
+        state = X2UltraState(
             physics_data=data,
             time=jp.array(0.0),
             steps=jp.array(0),
-            command=command,
-            last_action=jp.zeros(self.action_dim),
-            rng=rng
+            command=cmd,
+            last_action=jp.zeros(self.action_dim)
         )
         
-        # 获取观测
-        obs = self._get_obs(state)
-        
-        return state, obs
+        return state, self._get_obs(state)
     
-    @partial(jax.jit, static_argnums=(0,))
-    def step(
+    def _step_impl(
         self,
-        state: X2UltraEnvState,
+        state: X2UltraState,
         action: jp.ndarray,
         rng: jp.ndarray
-    ) -> Tuple[X2UltraEnvState, jp.ndarray, jp.ndarray, jp.ndarray, jp.ndarray, Dict]:
-        """纯函数式 step，完全可 JIT"""
+    ):
+        """JIT 兼容的 step"""
+        # 动作限幅 [-1, 1] 然后缩放
+        action = jp.clip(action, -1.0, 1.0)
+        ctrl = action * self.const.ACTION_CONFIG["action_scale"]
         
-        # 处理动作（PD 控制）
-        ctrl = self._action_to_ctrl(state, action)
-        
-        # 模拟多个子步
+        # 模拟
         data = state.physics_data
         
-        def sim_step(carry, _):
-            d = carry
+        def sim_step(d, _):
             d = d.replace(ctrl=ctrl)
-            d = mjx.step(self._model_jx, d)
-            return d, None
+            return mjx.step(self._model_jx, d), None
         
-        data, _ = jax.lax.scan(
-            sim_step,
-            data,
-            None,
-            length=self.config.control_substeps
-        )
+        data, _ = jax.lax.scan(sim_step, data, None, 
+                               length=self.const.CONTROL_SUBSTEPS)
         
-        # 更新时间
-        dt = self.config.control_substeps * self._model.opt.timestep
+        # 更新
+        dt = self.const.CONTROL_SUBSTEPS * self._model.opt.timestep
         new_time = state.time + dt
         new_steps = state.steps + 1
         
-        # 更新命令（定期）
+        # 命令更新（每 50 步 = 1秒）
         rng, cmd_rng = jax.random.split(rng)
-        new_command = jax.lax.cond(
-            new_steps % 10 == 0,  # 10Hz 命令更新
+        new_cmd = jax.lax.cond(
+            new_steps % 50 == 0,
             lambda _: self._sample_command(cmd_rng),
             lambda _: state.command,
             None
         )
         
-        # 创建新状态
-        new_state = X2UltraEnvState(
+        new_state = X2UltraState(
             physics_data=data,
             time=new_time,
             steps=new_steps,
-            command=new_command,
-            last_action=action,
-            rng=rng
+            command=new_cmd,
+            last_action=action
         )
         
-        # 获取观测
         obs = self._get_obs(new_state)
-        
-        # 计算奖励
         reward = self._compute_reward(new_state, action)
-        
-        # 检查终止
         done = self._check_termination(new_state)
         truncated = new_steps >= self.const.TERMINATION_CONFIG["max_episode_length"]
         
-        # 信息字典（JAX 兼容）
-        info = {
-            "reward": reward,
-            "height": data.xpos[1, 2],  # 身体高度
-        }
+        info = {"height": data.xpos[1, 2]}
         
         return new_state, obs, reward, done, truncated, info
     
-    # =========================================================================
+    # ========================================================================
     # 辅助函数
-    # =========================================================================
+    # ========================================================================
     
     def _sample_command(self, rng: jp.ndarray) -> jp.ndarray:
-        """采样随机命令"""
-        limits = self.const.COMMAND_LIMITS
+        """随机命令"""
+        lim = self.const.COMMAND_LIMITS
         rngs = jax.random.split(rng, 4)
-        
         return jp.array([
-            jax.random.uniform(rngs[0], minval=limits["forward_speed"][0], maxval=limits["forward_speed"][1]),
-            jax.random.uniform(rngs[1], minval=limits["lateral_speed"][0], maxval=limits["lateral_speed"][1]),
-            jax.random.uniform(rngs[2], minval=limits["turning_rate"][0], maxval=limits["turning_rate"][1]),
-            jax.random.uniform(rngs[3], minval=limits["body_height"][0], maxval=limits["body_height"][1]),
+            jax.random.uniform(rngs[0], lim["forward_speed"][0], lim["forward_speed"][1]),
+            jax.random.uniform(rngs[1], lim["lateral_speed"][0], lim["lateral_speed"][1]),
+            jax.random.uniform(rngs[2], lim["turning_rate"][0], lim["turning_rate"][1]),
+            jax.random.uniform(rngs[3], lim["body_height"][0], lim["body_height"][1]),
         ])
     
-    def _action_to_ctrl(self, state: X2UltraEnvState, action: jp.ndarray) -> jp.ndarray:
-        """将动作转换为控制信号"""
-        cfg = self.const.ACTION_CONFIG
-        
-        if cfg["action_type"] == "torque":
-            return action * cfg["action_scale"]
-        elif cfg["action_type"] == "position":
-            # PD 控制
-            current_pos = state.physics_data.qpos[7:]
-            current_vel = state.physics_data.qvel[6:]
-            target_pos = action
-            
-            kp = cfg["kp"]
-            kd = cfg["kd"]
-            
-            ctrl = kp * (target_pos - current_pos) - kd * current_vel
-            return jp.clip(ctrl, *cfg["clip_range"])
-        else:
-            raise ValueError(f"未知动作类型: {cfg['action_type']}")
-    
-    def _get_obs(self, state: X2UltraEnvState) -> jp.ndarray:
-        """获取观测（纯函数）"""
-        obs_parts = []
-        data = state.physics_data
+    def _get_obs(self, state: X2UltraState) -> jp.ndarray:
+        """构建观测"""
+        parts = []
+        d = state.physics_data
         cfg = self.const.OBSERVATION_CONFIG
         
-        # 关节位置
+        # [关键修复] 正确提取29个关节的状态
         if cfg["include_joint_pos"]:
-            obs_parts.append(data.qpos[7:])
+            # qpos: [7自由关节 + n_joints]，取后29个
+            joint_pos = d.qpos[7:7+self.action_dim]
+            parts.append(joint_pos)
         
-        # 关节速度
         if cfg["include_joint_vel"]:
-            obs_parts.append(data.qvel[6:])
+            # qvel: [6自由关节速度 + n_joints速度]
+            joint_vel = d.qvel[6:6+self.action_dim]
+            parts.append(joint_vel)
         
-        # 身体速度（从 cvel）
+        # IMU数据
         if cfg["include_body_lin_vel"]:
-            # 注意：mjx 中 cvel 的索引可能需要调整
-            obs_parts.append(data.cvel[1, 3:6])
-        
+            parts.append(d.cvel[1, 3:6])
         if cfg["include_body_ang_vel"]:
-            obs_parts.append(data.cvel[1, 0:3])
-        
-        # 身体高度
+            parts.append(d.cvel[1, 0:3])
         if cfg["include_body_height"]:
-            obs_parts.append(jp.array([data.xpos[1, 2]]))
-        
-        # 重力向量
+            parts.append(jp.array([d.xpos[1, 2]]))
         if cfg["include_gravity_vector"]:
-            # 从四元数计算
-            quat = data.xquat[1]
-            gravity = mjx._src.math.quat_rotate(quat, jp.array([0, 0, -1]))
-            obs_parts.append(gravity)
+            # [关键修复] 手动实现四元数旋转
+            quat = d.xquat[1]
+            gravity = self._quat_rotate(quat, jp.array([0., 0., -1.]))
+            parts.append(gravity)
         
-        # 命令
+        # 命令和相位
         if cfg["include_command"]:
-            obs_parts.append(state.command)
-        
-        # 相位（简化）
+            parts.append(state.command)
         if cfg["include_phase"]:
-            phase = jp.sin(2 * jp.pi * state.time * 1.5)  # 1.5Hz 步态
-            obs_parts.append(jp.array([phase]))
-        
-        # 上次动作
+            phase = jp.sin(2 * jp.pi * state.time * 1.5)
+            parts.append(jp.array([phase]))
         if cfg["include_last_action"]:
-            obs_parts.append(state.last_action)
+            parts.append(state.last_action)
         
-        return jp.concatenate(obs_parts)
+        return jp.concatenate(parts)
     
-    def _compute_reward(self, state: X2UltraEnvState, action: jp.ndarray) -> jp.ndarray:
-        """计算奖励（需要丰富的奖励函数才能学习行走）"""
-        data = state.physics_data
-        weights = self.const.REWARD_WEIGHTS
+    def _quat_rotate(self, q: jp.ndarray, v: jp.ndarray) -> jp.ndarray:
+        """手动实现四元数旋转避免私有 API"""
+       # q = [w, x, y, z]
+        w, x, y, z = q[0], q[1], q[2], q[3]
         
-        # 目标速度跟踪
-        target_vel = state.command[0]  # 前进速度
-        actual_vel = data.cvel[1, 3]  # x方向速度
-        vel_error = jp.abs(actual_vel - target_vel)
-        vel_reward = weights["forward_velocity"] * (1.0 - vel_error)
+        # 计算 q * v * q^-1
+        # 纯虚四元数
+        qv = jp.array([0., v[0], v[1], v[2]])
         
-        # 直立奖励
-        quat = data.xquat[1]
-        uprightness = quat[0]  # w 分量，接近1表示直立
-        upright_reward = weights["upright"] * uprightness
+        # 四元数乘法
+        t = jp.array([
+            -x*qv[1] - y*qv[2] - z*qv[3],
+            w*qv[1] + y*qv[3] - z*qv[2],
+            w*qv[2] - x*qv[3] + z*qv[1],
+            w*qv[3] + x*qv[2] - y*qv[1]
+        ])
         
-        # 能量惩罚
-        joint_vel = data.qvel[6:]
+        result = jp.array([
+            t[1]*w - t[0]*x - t[3]*y + t[2]*z,
+            t[2]*w + t[3]*x - t[0]*y - t[1]*z,
+            t[3]*w - t[2]*x + t[1]*y - t[0]*z
+        ])
+        
+        return result
+    
+    def _compute_reward(self, state: X2UltraState, action: jp.ndarray) -> jp.ndarray:
+        """丰富奖励函数"""
+        d = state.physics_data
+        w = self.const.REWARD_WEIGHTS
+        
+        # 速度跟踪（主要奖励）
+        target_fwd = state.command[0]
+        actual_fwd = d.cvel[1, 3]  # x 速度
+        vel_reward = w["forward_velocity"] * jp.exp(-2.0 * (actual_fwd - target_fwd)**2)
+        
+        # 侧向速度惩罚（保持直线）
+        lat_vel = d.cvel[1, 4]
+        lat_penalty = -0.5 * lat_vel**2
+        
+        # 直立
+        quat = d.xquat[1]
+        upright = quat[0]  # w
+        upright_reward = w["upright"] * (upright ** 2)
+        
+        # 高度
+        height = d.xpos[1, 2]
+        target_h = state.command[3]
+        height_reward = -1.0 * jp.abs(height - target_h)
+        
+        # 能量
+        joint_vel = d.qvel[6:6+self.action_dim]
         energy = jp.sum(jp.abs(action * joint_vel))
-        energy_penalty = weights["energy_efficiency"] * energy
+        energy_penalty = w["energy_efficiency"] * energy
         
-        # 高度奖励
-        height = data.xpos[1, 2]
-        target_height = state.command[3]
-        height_reward = -0.5 * jp.abs(height - target_height)
+        # 动作平滑（需要历史，这里简化）
+        smooth_penalty = -0.001 * jp.sum(action ** 2)
         
-        # 生存奖励
-        survival = weights["survival"]
+        # 生存
+        survival = w["survival"]
         
-        total = vel_reward + upright_reward + energy_penalty + height_reward + survival
+        total = (vel_reward + lat_penalty + upright_reward + 
+                height_reward + energy_penalty + smooth_penalty + survival)
         
-        # 确保是标量
         return jp.squeeze(total)
     
-    def _check_termination(self, state: X2UltraEnvState) -> jp.ndarray:
-        """检查是否终止"""
-        data = state.physics_data
+    def _check_termination(self, state: X2UltraState) -> jp.ndarray:
+        """终止检查"""
+        d = state.physics_data
         cfg = self.const.TERMINATION_CONFIG
         
-        # 高度检查
-        height = data.xpos[1, 2]
+        height = d.xpos[1, 2]
         too_low = height < cfg["min_body_height"]
         
-        # 倾斜检查
-        quat = data.xquat[1]
-        tilt = jp.arccos(jp.clip(jp.abs(quat[0]), -1.0, 1.0)) * 2
-        too_tilted = tilt > cfg["max_body_tilt"]
+        quat = d.xquat[1]
+        # 简化倾斜检查
+        tilt_penalty = 1.0 - quat[0]**2  # 偏离直立的程度
+        too_tilted = tilt_penalty > 0.5  # 约 60 度
         
         return jp.logical_or(too_low, too_tilted)
      
