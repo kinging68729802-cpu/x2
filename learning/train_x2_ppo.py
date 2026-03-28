@@ -39,7 +39,7 @@ class PPOConfig:
     """PPO训练配置"""
     # 环境参数
     env_name: str = "x2_ultra"
-    num_envs: int = 512  # 并行环境数（根据GPU内存调整）
+    num_envs: int = 32  # 并行环境数（根据GPU内存调整）
     episode_length: int = 1000
     
     # PPO超参数
